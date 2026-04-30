@@ -1,0 +1,17 @@
+# Entorno virtual: se recrea con pip install
+venv/
+
+# Modelos de IA: se descargan automáticamente al ejecutar
+*.pt
+*.pth
+
+# Archivos de Python compilados
+__pycache__/
+*.pyc
+*.pyo
+
+# Variables de entorno con credenciales (Twilio, etc.)
+.env
+
+# Archivos temporales de VS Code
+.vscode/
