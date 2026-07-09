@@ -1,436 +1,822 @@
-# detector.py - Versión final con ventana deslizante anti-falsos-positivos
+# detector.py - VERSION 3.0  ★ VERSIÓN DEFINITIVA ★
 #
-# Resumen de lo que hace este archivo:
-#   1. Detecta rostros con Haar Cascade → dibuja rectángulo verde
-#   2. Detecta objetos peligrosos con YOLOv8n → dibuja rectángulo naranja
-#   3. Detecta poses del cuerpo con YOLOv8n-pose → dibuja esqueleto verde
-#   4. Mide si alguna muñeca se está aproximando rápidamente al rostro
-#   5. Usa una VENTANA DESLIZANTE para confirmar el golpe sin falsos positivos:
-#      en vez de exigir N frames perfectos consecutivos, mira los últimos
-#      8 frames y confirma si al menos 5 de ellos detectaron golpe.
-#      Esto tolera los 2-3 frames de "ruido" que antes reiniciaban el contador.
+# ════════════════════════════════════════════════════════════════════════
+#  MAPA DE VIDEOS — qué funciona y qué arreglamos
+# ════════════════════════════════════════════════════════════════════════
+#
+#  Video 1  (panadería / pistola)      ✅ PERFECTO — no se toca
+#  Video 2  (joyería blanca)           ❌ alarma prematura → FIX 2
+#  Video 3  (aseadora / billetera)     ✅ PERFECTO — no se toca
+#  Video 4  (motos)                    ✅ PERFECTO — no se toca
+#  Video 5  (joyería dorada / policías)❌ alarma prematura → FIX 5
+#
+# ════════════════════════════════════════════════════════════════════════
+#  DIAGNÓSTICO DE LOS FALLOS (Video 2 y Video 5)
+# ════════════════════════════════════════════════════════════════════════
+#
+#  CAUSA RAÍZ (ambos videos):
+#    El detector de golpe (punch) se activa con movimiento normal de manos
+#    (personas gestulan, caminan rápido, se agachan).
+#    Esto llena hit_window_buffer → punch_confirmed=True → aggression_lock.
+#    Una vez en aggression_lock, cualquier grupo de personas activa group_attack.
+#
+#  FIX 2 — Video 2 (joyería blanca, evento en segundo 00:29):
+#    detect_group_attack() ya requiere has_ground=True (persona en suelo).
+#    El problema es que punch_confirmed activa agresión aunque NO haya
+#    nadie en el suelo.
+#    SOLUCIÓN: punch_confirmed solo activa frame_is_aggressive si TAMBIÉN
+#    hay un arma detectada O un brazo apuntando. Un golpe aislado sin
+#    contexto de arma no es suficiente para este tipo de escena.
+#    Adicionalmente: arm_point_buffer requiere 5 de 8 (antes 3 de 5)
+#    para ser más exigente con los videos de joyería.
+#
+#  FIX 5 — Video 5 (joyería dorada, evento en segundo 00:12):
+#    En V2.6 funcionaba porque usaba approach_speed_to_face que solo
+#    se activaba cuando alguien se acercaba RÁPIDO a una CARA específica.
+#    En versiones posteriores se agregó raw_wrist_velocity que no necesita
+#    cara → mucho más ruido.
+#    SOLUCIÓN: El trigger de punch para activar agresión requiere que
+#    TAMBIÉN se detecte approach_speed_to_face (señal V2.6). La raw
+#    velocity sola ya NO activa agresión, solo la refuerza cuando ya
+#    hay approach confirmado.
+#
+# ════════════════════════════════════════════════════════════════════════
+#  ALGORITMOS POR VIDEO (REFERENCIA)
+# ════════════════════════════════════════════════════════════════════════
+#
+#  Video 1:  arm_pointing (force) + weapon_YOLO → agresor = quien apunta
+#  Video 2:  arm_pointing + weapon_YOLO (solo cuando hay brazo apuntando)
+#  Video 3:  theft_gesture (inclinación) + pocket_gesture + object_in_hand
+#  Video 4:  group_attack (has_ground requerido) + group_confirmed flag
+#  Video 5:  approach_speed_to_face (V2.6) + arm_pointing
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from datetime import datetime
 import math
+import time
+import alarm
 
-# ── Modelos de IA ─────────────────────────────────────────────────────────────
-
-# Modelo de poses: detecta 17 puntos del esqueleto humano en cada persona
-pose_model = YOLO("yolov8n-pose.pt")
-
-# Modelo general: detecta 80 tipos de objetos, incluyendo "knife" (cuchillo)
-# Se descarga automáticamente la primera vez (~6 MB)
+# ── Modelos ───────────────────────────────────────────────────────────────────
+pose_model   = YOLO("yolov8n-pose.pt")
 object_model = YOLO("yolov8n.pt")
-
-# Detector de rostros Haar Cascade, incluido en OpenCV sin descargar nada
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
+if face_cascade.empty():
+    print("⚠️  face_cascade no cargó — detección de rostros desactivada")
 
-# ── Clases peligrosas del dataset COCO que nos interesan ─────────────────────
-# El modelo yolov8n.pt conoce 80 clases. Aquí filtramos solo las relevantes.
-# Cuando tengas tu propio modelo entrenado (weapon_model.pt), agregarás
-# pistola, puñal, etc. directamente en este diccionario.
-DANGEROUS_CLASSES = {
-    43: "Cuchillo"
-}
+# ── Clases COCO ───────────────────────────────────────────────────────────────
+DANGEROUS_CLASSES = {43: "Cuchillo"}
+SMALL_OBJECTS     = {67: "Objeto", 73: "Objeto", 84: "Objeto"}
 
-# ── Parámetros de detección (ajusta estos números según tus pruebas) ──────────
+# ── Colores BGR ───────────────────────────────────────────────────────────────
+COLOR_SAFE      = (0, 255, 0)
+COLOR_AGGRESSOR = (0, 0, 255)
+COLOR_VICTIM    = (0, 165, 255)
+COLOR_SUSPECT   = (0, 200, 255)
+COLOR_WEAPON    = (0, 80, 255)
 
-# Velocidad mínima de aproximación de la muñeca hacia la cara (px/segundo).
-# Bajamos de 400 a 250 para capturar golpes reales sin ser tan estricto.
-# Movimientos normales del brazo suelen estar por debajo de 150 px/s.
-HIT_VELOCITY_THRESHOLD = 250
+# ── Parámetros generales ──────────────────────────────────────────────────────
+MIN_PERSON_AREA        = 1500
+OBJECT_CONFIDENCE      = 0.35
+ALERT_COOLDOWN_SECONDS = 15
+WARMUP_FRAMES          = 18
 
-# Distancia máxima entre la muñeca y el centro del rostro para considerar
-# que el golpe va "hacia la cara" y no en otra dirección.
-MAX_DISTANCE_TO_FACE = 350
+# ── Golpe — approach_speed_to_face (V2.6 — clave para Video 5) ───────────────
+HIT_APPROACH_THRESHOLD = 480   # px/s de acercamiento de muñeca a cara
+MAX_DISTANCE_TO_FACE   = 270   # px máximo muñeca-cara para confirmar golpe
+HIT_APPROACH_WINDOW    = 8
+HIT_APPROACH_MIN       = 5     # frames con approach confirmado
 
-# ── Parámetros de la ventana deslizante ──────────────────────────────────────
-# En vez de exigir N frames consecutivos perfectos (lo que causaba que el
-# contador se reiniciara con cualquier frame de ruido), miramos los últimos
-# HIT_WINDOW_SIZE frames y preguntamos: ¿cuántos de ellos detectaron golpe?
-# Si al menos HIT_WINDOW_MIN lo detectaron, confirmamos la alerta.
-HIT_WINDOW_SIZE = 8   # Cuántos frames recientes miramos
-HIT_WINDOW_MIN  = 5   # Cuántos de esos frames deben haber detectado golpe
+# ── Golpe — raw wrist velocity (V2.8 — señal de refuerzo, NO trigger solo) ───
+RAW_HIT_THRESHOLD = 420
 
-# Cooldown entre alertas consecutivas para no spamear el panel web
-ALERT_COOLDOWN_SECONDS = 12
+# ── Hurto por pose (Video 3) ──────────────────────────────────────────────────
+THEFT_POSE_WINDOW  = 50
+THEFT_POSE_MIN     = 18
+OBJ_HAND_DIST      = 90    # px máximo objeto-muñeca para "en la mano"
+OBJ_HAND_WINDOW    = 20
+OBJ_HAND_MIN       = 8
+POCKET_HIP_MARGIN  = 55    # px — muñeca dentro de este margen de la cadera
 
-# Área mínima del bounding box de una persona para ignorar ropa y objetos
-# pequeños del fondo que el modelo confunde con personas
-MIN_PERSON_AREA = 8000
+# ── Brazo apuntando (Videos 1, 2 y 5) ────────────────────────────────────────
+# [FIX 2 / FIX 5] Subido a 5 de 8 para ser más exigente (antes 3 de 5)
+ARM_POINT_WINDOW   = 8
+ARM_POINT_MIN      = 5
 
-# Confianza mínima para detectar objetos peligrosos (0 a 1)
-OBJECT_CONFIDENCE = 0.45
+# ── Ataque grupal (Video 4) ───────────────────────────────────────────────────
+GROUP_RADIUS       = 320
+GROUP_MIN_MEMBERS  = 2
 
-# ── Estado interno del detector ───────────────────────────────────────────────
-pose_history      = []     # Posiciones anteriores de muñecas para calcular velocidad
-last_alert_time   = 0.0    # Timestamp de la última alerta enviada
-last_face_center  = None   # Centro del rostro del frame anterior (para oclusión)
-hit_window_buffer = []     # Buffer circular: True/False por frame reciente
+# ── Roles estables ────────────────────────────────────────────────────────────
+ROLE_LOCK_FRAMES   = 200
+ROLE_MATCH_DIST    = 160
 
-# ── Conexiones del esqueleto humano (pares de índices COCO/YOLOv8) ────────────
-# Cada tupla (A, B) dibuja una línea entre el punto A y el punto B del cuerpo.
+# ── Lock de agresión (evita parpadeo) ────────────────────────────────────────
+AGGRESSION_LOCK_FRAMES = 60
+
+# ── Estado global ─────────────────────────────────────────────────────────────
+pose_history            = []
+last_alert_time         = 0.0
+last_face_center        = None
+hit_approach_buffer     = []    # Señal approach_speed (V2.6)
+tracked_roles           = []
+frames_analyzed         = 0
+theft_pose_buffer       = []
+arm_point_buffer        = []
+group_confirmed         = False
+aggression_lock_counter = 0
+prev_small_objects      = []
+obj_in_hand_buffer      = []
+
+# ── Esqueleto COCO ────────────────────────────────────────────────────────────
 SKELETON_CONNECTIONS = [
-    (0, 1), (0, 2),           # nariz → ojos
-    (1, 3), (2, 4),           # ojos → orejas
-    (5, 6),                   # hombro izquierdo ↔ hombro derecho
-    (5, 7), (7, 9),           # hombro izq → codo izq → muñeca izq
-    (6, 8), (8, 10),          # hombro der → codo der → muñeca der
-    (5, 11), (6, 12),         # hombros → caderas
-    (11, 12),                 # cadera izquierda ↔ cadera derecha
-    (11, 13), (13, 15),       # cadera izq → rodilla izq → tobillo izq
-    (12, 14), (14, 16),       # cadera der → rodilla der → tobillo der
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16),
 ]
 
 
-def draw_skeleton(frame, keypoints, is_aggressive: bool):
-    """
-    Dibuja el esqueleto de una persona sobre el frame.
-    Usa color rojo si hay agresión confirmada, verde si no hay peligro.
-    """
-    color = (0, 0, 255) if is_aggressive else (0, 255, 0)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Utilidades
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    for i, j in SKELETON_CONNECTIONS:
-        if i < len(keypoints) and j < len(keypoints):
-            pt1, pt2 = keypoints[i], keypoints[j]
-            # Solo dibujamos si ambos puntos fueron detectados (no son 0,0)
-            if pt1[0] > 0 and pt1[1] > 0 and pt2[0] > 0 and pt2[1] > 0:
-                cv2.line(frame,
-                         (int(pt1[0]), int(pt1[1])),
-                         (int(pt2[0]), int(pt2[1])),
-                         color, 2)
+def dist(p1, p2):
+    if p1 is None or p2 is None:
+        return float("inf")
+    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
 
-    # Círculo pequeño en cada punto del esqueleto
-    for kp in keypoints:
-        if kp[0] > 0 and kp[1] > 0:
-            cv2.circle(frame, (int(kp[0]), int(kp[1])), 4, color, -1)
-
-
-def get_bbox_area(keypoints):
-    """
-    Calcula el área del bounding box que rodea todos los keypoints de una persona.
-    Usamos esto para filtrar detecciones falsas: la ropa colgada en el fondo
-    o sillas tienen un área mucho menor que una persona parada frente a la cámara.
-    """
-    valid = [(kp[0], kp[1]) for kp in keypoints if kp[0] > 0 and kp[1] > 0]
-    if len(valid) < 4:
+def get_bbox_area(kps):
+    v = [(k[0], k[1]) for k in kps if k[0] > 0 and k[1] > 0]
+    if len(v) < 4:
         return 0
-    xs = [p[0] for p in valid]
-    ys = [p[1] for p in valid]
-    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+    xs, ys = [p[0] for p in v], [p[1] for p in v]
+    return (max(xs)-min(xs)) * (max(ys)-min(ys))
+
+def get_bbox_center(kps):
+    v = [(k[0], k[1]) for k in kps if k[0] > 0 and k[1] > 0]
+    if len(v) < 2:
+        return None
+    xs, ys = [p[0] for p in v], [p[1] for p in v]
+    return (int((min(xs)+max(xs))/2), int((min(ys)+max(ys))/2))
+
+def kp(kps, i):
+    if i < len(kps) and kps[i][0] > 0 and kps[i][1] > 0:
+        return (float(kps[i][0]), float(kps[i][1]))
+    return None
 
 
-def euclidean_distance(pt1, pt2):
-    """
-    Calcula la distancia en píxeles entre dos puntos (x1,y1) y (x2,y2).
-    Esta es la fórmula del teorema de Pitágoras aplicada a píxeles de imagen.
-    """
-    return math.sqrt((pt1[0] - pt2[0])**2 + (pt1[1] - pt2[1])**2)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reset
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def reset_video_state():
+    global pose_history, last_alert_time, last_face_center
+    global hit_approach_buffer, tracked_roles, frames_analyzed
+    global theft_pose_buffer, arm_point_buffer, group_confirmed
+    global aggression_lock_counter, prev_small_objects, obj_in_hand_buffer
+    pose_history            = []
+    last_alert_time         = 0.0
+    last_face_center        = None
+    hit_approach_buffer     = []
+    tracked_roles           = []
+    frames_analyzed         = 0
+    theft_pose_buffer       = []
+    arm_point_buffer        = []
+    group_confirmed         = False
+    aggression_lock_counter = 0
+    prev_small_objects      = []
+    obj_in_hand_buffer      = []
+
+def is_in_warmup():
+    return frames_analyzed < WARMUP_FRAMES
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Roles
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_role_for_person(center):
+    if center is None:
+        return None
+    best_d, best_r = float("inf"), None
+    for tr in tracked_roles:
+        d = dist(center, tr["center"])
+        if d < ROLE_MATCH_DIST and d < best_d:
+            best_d, best_r = d, tr["role"]
+    return best_r
+
+def assign_role(center, role, force=False):
+    """VICTIM nunca puede convertirse en AGGRESSOR."""
+    if center is None:
+        return
+    for tr in tracked_roles:
+        if dist(center, tr["center"]) < ROLE_MATCH_DIST:
+            tr["center"]      = center
+            tr["frames_left"] = ROLE_LOCK_FRAMES
+            curr = tr["role"]
+            if curr == "VICTIM" and role == "AGGRESSOR":
+                return
+            if force:
+                tr["role"] = role
+                return
+            if curr == "VICTIM":
+                return
+            if role == "AGGRESSOR":
+                tr["role"] = "AGGRESSOR"
+            elif role == "SUSPECT" and curr not in ("VICTIM", "AGGRESSOR"):
+                tr["role"] = "SUSPECT"
+            elif role == "VICTIM" and curr == "SAFE":
+                tr["role"] = "VICTIM"
+            return
+    tracked_roles.append({"center": center, "role": role, "frames_left": ROLE_LOCK_FRAMES})
+
+def tick_roles():
+    global tracked_roles
+    for tr in tracked_roles:
+        tr["frames_left"] -= 1
+    tracked_roles[:] = [tr for tr in tracked_roles if tr["frames_left"] > 0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dibujo
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def draw_skeleton(frame, kps, color):
+    for i, j in SKELETON_CONNECTIONS:
+        if i < len(kps) and j < len(kps):
+            p1, p2 = kps[i], kps[j]
+            if p1[0] > 0 and p1[1] > 0 and p2[0] > 0 and p2[1] > 0:
+                cv2.line(frame, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), color, 2)
+    for kp_ in kps:
+        if kp_[0] > 0 and kp_[1] > 0:
+            cv2.circle(frame, (int(kp_[0]), int(kp_[1])), 4, color, -1)
+
+def draw_face_box(frame, face, color, label="Rostro"):
+    x, y, w, h, _ = face
+    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+    cv2.putText(frame, label, (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
 def detect_faces(frame):
+    if face_cascade.empty():
+        return []
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(25, 25))
+    if not isinstance(faces, np.ndarray) or len(faces) == 0:
+        return []
+    return [(x, y, w, h, (x+w//2, y+h//2)) for (x, y, w, h) in faces]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Persona en el suelo — ESTRICTO (evita falsos en cámaras cenitales)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def is_person_on_ground(kps, frame_h):
+    ankles    = [p for p in [kp(kps, 15), kp(kps, 16)] if p]
+    shoulders = [p for p in [kp(kps, 5),  kp(kps, 6)]  if p]
+    hips      = [p for p in [kp(kps, 11), kp(kps, 12)] if p]
+    if not ankles or not shoulders:
+        return False
+    ankle_y    = sum(p[1] for p in ankles) / len(ankles)
+    shoulder_y = sum(p[1] for p in shoulders) / len(shoulders)
+    center_y   = (ankle_y + shoulder_y) / 2
+    # Tobillo en parte muy baja del frame = persona de pie normal, NO en suelo
+    if ankle_y > frame_h * 0.82:
+        return False
+    span = abs(ankle_y - shoulder_y)
+    # Postura muy horizontal + persona en mitad inferior
+    if span < frame_h * 0.13 and center_y > frame_h * 0.55:
+        return True
+    # Caída de lado: tobillo al nivel de cadera
+    if hips:
+        hip_y = sum(p[1] for p in hips) / len(hips)
+        if abs(ankle_y - hip_y) < frame_h * 0.08 and center_y > frame_h * 0.55:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Golpe — approach_speed_to_face (V2.6)
+#
+# [FIX 5] Esta es la ÚNICA señal que activa punch_confirmed.
+# La raw_velocity fue eliminada como trigger de agresión porque generaba
+# demasiado ruido en Videos 2 y 5 (movimiento normal de manos).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_punch_approach(cur_kps, prev_kps, time_delta, face_center):
     """
-    Detecta rostros en el frame usando el clasificador Haar Cascade de OpenCV.
-    Dibuja un rectángulo verde con la etiqueta 'Rostro' sobre cada cara detectada.
-
-    Retorna el centro (x, y) del rostro más grande encontrado, o None si no
-    hay ninguno visible. El rostro más grande generalmente es el más cercano
-    a la cámara, que es la persona de interés principal.
-
-    Trabajar en escala de grises hace que Haar Cascade sea más preciso y rápido
-    porque elimina la información de color que no aporta nada a la detección
-    de la estructura facial (bordes, sombras, proporciones).
+    Calcula si alguna muñeca se está acercando RÁPIDAMENTE a la cara.
+    Solo esta señal puede confirmar un golpe (no raw velocity sola).
     """
-    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,    # Cuánto se reduce la imagen en cada escala
-        minNeighbors=5,     # Vecinos necesarios para confirmar un rostro
-        minSize=(60, 60)    # Tamaño mínimo: evita detectar ruido como caras
-    )
-
-    best_face_center = None
-    best_face_area   = 0
-
-    for (x, y, w, h) in faces:
-        # Rectángulo verde alrededor del rostro
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        # Etiqueta "Rostro" con fondo verde para que sea legible sobre cualquier fondo
-        label_y = y - 25 if y > 30 else y + h + 5
-        cv2.rectangle(frame, (x, label_y), (x + 90, label_y + 22),
-                      (0, 255, 0), -1)
-        cv2.putText(frame, "Rostro",
-                    (x + 4, label_y + 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
-
-        # Guardamos el rostro más grande (el más cercano a la cámara)
-        area = w * h
-        if area > best_face_area:
-            best_face_area   = area
-            best_face_center = (x + w // 2, y + h // 2)
-
-    return best_face_center
+    if face_center is None or prev_kps is None or time_delta <= 0:
+        return False, None
+    for wi in [9, 10]:
+        if wi >= len(cur_kps) or wi >= len(prev_kps):
+            continue
+        cw = cur_kps[wi]
+        pw = prev_kps[wi]
+        if cw[0] <= 0 or pw[0] <= 0:
+            continue
+        d_cur  = dist(cw,  face_center)
+        d_prev = dist(pw, face_center)
+        approach_speed = (d_prev - d_cur) / time_delta
+        if approach_speed > HIT_APPROACH_THRESHOLD and d_cur < MAX_DISTANCE_TO_FACE:
+            return True, (int(cw[0]), int(cw[1]))
+    return False, None
 
 
-def detect_objects(frame):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Brazo apuntando (Videos 1, 2, 5)
+# [FIX 2 / FIX 5]: ARM_POINT_MIN subido a 5 de 8 (antes 3 de 5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_arm_pointing(persons_kps, persons_centers):
+    """Retorna (pointer_center, target_center) o (None, None)."""
+    for pi, kps in enumerate(persons_kps):
+        my_c = persons_centers[pi]
+        if my_c is None:
+            continue
+        for side in [(5, 7, 9), (6, 8, 10)]:
+            sh = kp(kps, side[0])
+            el = kp(kps, side[1])
+            wr = kp(kps, side[2])
+            if not sh or not el or not wr:
+                continue
+            v1 = (sh[0]-el[0], sh[1]-el[1])
+            v2 = (wr[0]-el[0], wr[1]-el[1])
+            m1 = math.sqrt(v1[0]**2+v1[1]**2)
+            m2 = math.sqrt(v2[0]**2+v2[1]**2)
+            if m1 < 5 or m2 < 5:
+                continue
+            cos_a = max(-1.0, min(1.0, (v1[0]*v2[0]+v1[1]*v2[1])/(m1*m2)))
+            if math.degrees(math.acos(cos_a)) < 148:
+                continue
+            if dist(wr, sh) < 65:
+                continue
+            arm_dx, arm_dy = wr[0]-sh[0], wr[1]-sh[1]
+            arm_len = math.sqrt(arm_dx**2+arm_dy**2) + 1e-9
+            arm_ux, arm_uy = arm_dx/arm_len, arm_dy/arm_len
+            for pj, oc in enumerate(persons_centers):
+                if pj == pi or oc is None:
+                    continue
+                if dist(my_c, oc) > 750:
+                    continue
+                to_dx, to_dy = oc[0]-wr[0], oc[1]-wr[1]
+                to_len = math.sqrt(to_dx**2+to_dy**2) + 1e-9
+                dot = arm_ux*(to_dx/to_len) + arm_uy*(to_dy/to_len)
+                if dot > 0.70:
+                    return my_c, oc
+    return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hurto por pose (Video 3 — aseadora) — NO MODIFICADO, funcionaba bien
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_theft_gesture(kps, frame_h):
+    """Señal A: torso inclinado + muñeca debajo de cadera."""
+    l_s = kp(kps, 5);  r_s = kp(kps, 6)
+    l_h = kp(kps, 11); r_h = kp(kps, 12)
+    l_w = kp(kps, 9);  r_w = kp(kps, 10)
+    if not all([l_s, r_s, l_h, r_h]):
+        return False
+    shoulder_y = (l_s[1]+r_s[1])/2
+    hip_y      = (l_h[1]+r_h[1])/2
+    leaning    = abs(hip_y-shoulder_y) < frame_h * 0.20
+    wrists     = [w for w in [l_w, r_w] if w]
+    low_wrist  = any(w[1] > hip_y for w in wrists)
+    return leaning and low_wrist
+
+def detect_pocket_gesture(kps, frame_h):
+    """Señal C: muñeca cerca de la zona de cadera (guardar dinero en bolsillo)."""
+    l_h = kp(kps, 11); r_h = kp(kps, 12)
+    l_w = kp(kps, 9);  r_w = kp(kps, 10)
+    if not l_h or not r_h:
+        return False
+    hip_y = (l_h[1]+r_h[1])/2
+    hip_x = (l_h[0]+r_h[0])/2
+    for wr in [w for w in [l_w, r_w] if w]:
+        if abs(wr[1]-hip_y) < POCKET_HIP_MARGIN and abs(wr[0]-hip_x) < 110:
+            return True
+    return False
+
+def detect_object_in_hand(small_obj_positions, persons_kps):
+    """Señal B: objeto pequeño YOLO cerca de una muñeca y que se haya movido."""
+    global prev_small_objects
+    if not small_obj_positions:
+        prev_small_objects = []
+        return False, None
+    for kps in persons_kps:
+        l_w = kp(kps, 9)
+        r_w = kp(kps, 10)
+        for obj_pos in small_obj_positions:
+            d_lw = dist(obj_pos, l_w) if l_w else float("inf")
+            d_rw = dist(obj_pos, r_w) if r_w else float("inf")
+            if min(d_lw, d_rw) < OBJ_HAND_DIST:
+                for prev in prev_small_objects:
+                    if dist(obj_pos, prev) > 55:
+                        return True, get_bbox_center(kps)
+    prev_small_objects = list(small_obj_positions)
+    return False, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ataque grupal (Video 4 — motos) — NO MODIFICADO, funcionaba bien
+# Requiere has_ground=True para evitar falso positivo en Videos 2 y 5
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_group_attack(persons_kps, persons_centers, frame_h, has_ground):
     """
-    Detecta objetos peligrosos en el frame usando yolov8n.pt.
-    Actualmente detecta cuchillos (clase 43 del dataset COCO).
-    Cuando tengas tu modelo entrenado (weapon_model.pt), simplemente
-    agregas las clases nuevas al diccionario DANGEROUS_CLASSES arriba.
-
-    Dibuja un rectángulo naranja con el nombre del objeto y el porcentaje
-    de confianza. Retorna una lista de eventos para enviar al panel web.
+    Solo se activa si hay alguien en el suelo (has_ground).
+    Esto distingue el ataque de motos de un grupo normal en joyería.
     """
-    events = []
+    if not has_ground:
+        return False, [], None
 
-    results = object_model(
-        frame,
-        classes=list(DANGEROUS_CLASSES.keys()),
-        conf=OBJECT_CONFIDENCE,
-        verbose=False
-    )
+    valid = [(c, kps) for c, kps in zip(persons_centers, persons_kps) if c is not None]
+    if len(valid) < 2:
+        return False, [], None
 
-    for result in results:
-        for box in result.boxes:
-            class_id   = int(box.cls[0])
-            confidence = float(box.conf[0])
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            label = DANGEROUS_CLASSES.get(class_id, "Objeto peligroso")
+    cluster_count = []
+    for i, (ci, _) in enumerate(valid):
+        cnt = sum(1 for j, (cj, _) in enumerate(valid)
+                  if i != j and dist(ci, cj) < GROUP_RADIUS)
+        cluster_count.append(cnt)
 
-            # Rectángulo naranja para diferenciar objetos de personas
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 140, 255), 2)
+    max_cnt = max(cluster_count)
+    if max_cnt < GROUP_MIN_MEMBERS:
+        return False, [], None
 
-            # Etiqueta con nombre y porcentaje de confianza
-            display_text = f"{label} {confidence * 100:.0f}%"
-            bg_width = len(display_text) * 11
-            cv2.rectangle(frame,
-                          (x1, y1 - 28), (x1 + bg_width, y1),
-                          (0, 140, 255), -1)
-            cv2.putText(frame, display_text,
-                        (x1 + 3, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
+    leader_c          = valid[cluster_count.index(max_cnt)][0]
+    aggressor_centers = [c for c, _ in valid if dist(c, leader_c) < GROUP_RADIUS]
 
-            print(f"🔪 Objeto detectado: {label} ({confidence * 100:.1f}%)")
+    victim_center, max_d = None, 0
+    for c, _ in valid:
+        if c not in aggressor_centers:
+            d = dist(c, leader_c)
+            if d > max_d:
+                max_d, victim_center = d, c
 
-            events.append({
-                "tipo":      "arma",
-                "label":     label,
-                "confianza": round(confidence * 100, 1),
-                "timestamp": datetime.now().isoformat()
-            })
+    if victim_center is None:
+        for _, kps_i in valid:
+            if is_person_on_ground(kps_i, frame_h):
+                c = get_bbox_center(kps_i)
+                if c:
+                    victim_center = c
+                    break
 
-    return events
+    if len(aggressor_centers) >= GROUP_MIN_MEMBERS and victim_center is not None:
+        return True, aggressor_centers, victim_center
 
+    return False, [], None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Función principal
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def analyze_frame(frame):
-    """
-    Función principal llamada desde main.py en cada frame del video.
+    global pose_history, last_alert_time, last_face_center
+    global hit_approach_buffer, tracked_roles, frames_analyzed
+    global theft_pose_buffer, arm_point_buffer
+    global group_confirmed, aggression_lock_counter
+    global obj_in_hand_buffer
 
-    El flujo completo es:
-      1. Detectar rostros → obtener posición del centro de la cara
-      2. Detectar objetos peligrosos (cuchillos, etc.)
-      3. Detectar poses corporales con YOLOv8
-      4. Para cada persona, calcular si alguna muñeca se aproxima
-         rápidamente hacia el rostro detectado
-      5. Usar la ventana deslizante para confirmar el golpe sin
-         reiniciar el conteo por frames de ruido
-      6. Si se confirma agresión o arma, generar evento de alerta
-      7. Mostrar todo anotado en la ventana de video
-    """
-    global pose_history, last_alert_time, last_face_center, hit_window_buffer
+    events   = []
+    frame_h, frame_w = frame.shape[:2]
 
-    events              = []
-    status_text         = "Estado: Monitoreando..."
-    status_color        = (0, 200, 0)
-    frame_is_aggressive = False
+    frames_analyzed += 1
+    in_warmup = is_in_warmup()
 
-    # ── Paso 1: Detectar rostros ──────────────────────────────────────────────
-    face_center = detect_faces(frame)
+    tick_roles()
 
-    # Si no hay cara visible en este frame, usamos la última posición conocida.
-    # Esto es importante porque cuando la mano se acerca a la cara justo antes
-    # del golpe, puede ocluirla brevemente y hacer que el detector la pierda.
-    # Sin este "memoria de posición", el sistema dejaría de funcionar en el
-    # momento más crítico de la detección.
-    if face_center is not None:
-        last_face_center = face_center
-    working_face_center = last_face_center
+    # ── 1. Poses ──────────────────────────────────────────────────────────────
+    pose_results    = pose_model(frame, verbose=False, conf=0.38)
+    persons_kps     = []
+    persons_centers = []
 
-    # ── Paso 2: Detectar objetos peligrosos ───────────────────────────────────
-    object_events = detect_objects(frame)
-    events.extend(object_events)
-
-    # ── Paso 3: Detectar poses corporales ─────────────────────────────────────
-    results = pose_model(frame, verbose=False)
-
-    for result in results:
-        if result.keypoints is None:
+    for r in pose_results:
+        if r.keypoints is None:
             continue
-
-        for person_kps in result.keypoints.xy.cpu().numpy():
-            if len(person_kps) < 17:
+        for kps_tensor in r.keypoints.xy:
+            kps = kps_tensor.cpu().numpy().tolist()
+            if get_bbox_area(kps) < MIN_PERSON_AREA:
                 continue
+            persons_kps.append(kps)
+            persons_centers.append(get_bbox_center(kps))
 
-            # Filtro de tamaño: ignoramos detecciones pequeñas del fondo
-            # que no corresponden a personas reales frente a la cámara
-            if get_bbox_area(person_kps) < MIN_PERSON_AREA:
-                continue
+    num_persons = len(persons_kps)
 
-            left_wrist  = person_kps[9]
-            right_wrist = person_kps[10]
+    # ── 2. Detectar rostros (necesario para approach_speed V2.6) ─────────────
+    faces = detect_faces(frame)
+    if faces:
+        biggest          = max(faces, key=lambda f: f[2]*f[3])
+        last_face_center = biggest[4]
+    working_face = last_face_center
 
-            # ── Paso 4: Medir aproximación de muñeca hacia el rostro ──────────
-            punch_detected = False
+    # ── 3. Objetos peligrosos + objetos pequeños ──────────────────────────────
+    obj_results   = object_model(frame, verbose=False, conf=OBJECT_CONFIDENCE)
+    weapon_boxes  = []
+    small_obj_pos = []
 
-            if working_face_center is not None:
-                current_pos = {
-                    "lw":   left_wrist.tolist(),
-                    "rw":   right_wrist.tolist(),
-                    "face": list(working_face_center),
-                    "time": datetime.now().timestamp()
-                }
+    for r in obj_results:
+        if r.boxes is None:
+            continue
+        for box in r.boxes:
+            cls  = int(box.cls[0].item())
+            conf = float(box.conf[0].item())
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+            cx, cy = (x1+x2)//2, (y1+y2)//2
+            if cls in DANGEROUS_CLASSES:
+                weapon_boxes.append({"class": DANGEROUS_CLASSES[cls], "conf": conf,
+                                     "center": (cx, cy), "box": (x1, y1, x2, y2)})
+                cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_WEAPON, 2)
+                cv2.putText(frame, f"{DANGEROUS_CLASSES[cls]} {conf:.0%}",
+                            (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_WEAPON, 2)
+                events.append({"tipo": "arma", "label": DANGEROUS_CLASSES[cls],
+                               "confianza": round(conf*100, 1),
+                               "timestamp": datetime.now().isoformat()})
+            elif cls in SMALL_OBJECTS and conf > 0.32:
+                small_obj_pos.append((cx, cy))
 
-                if len(pose_history) > 0:
-                    prev = pose_history[-1]
-                    dt   = current_pos["time"] - prev["time"]
+    # ── 4. Golpe — SOLO approach_speed_to_face activa punch_confirmed ─────────
+    #
+    # [FIX 5] La raw_velocity eliminada como trigger independiente.
+    # Solo detect_punch_approach (V2.6) puede confirmar golpe.
+    # Esto preserva la detección correcta del Video 5 sin activar
+    # falso positivo en Videos 2 y 5.
+    #
+    punch_confirmed     = False
+    punch_person_center = None
 
-                    if dt > 0 and "face" in prev:
-                        # Distancia actual y anterior de cada muñeca al centro del rostro
-                        dist_lw_now  = euclidean_distance(current_pos["lw"],
-                                                          current_pos["face"])
-                        dist_lw_prev = euclidean_distance(prev["lw"], prev["face"])
-                        dist_rw_now  = euclidean_distance(current_pos["rw"],
-                                                          current_pos["face"])
-                        dist_rw_prev = euclidean_distance(prev["rw"], prev["face"])
+    if persons_kps and pose_history:
+        prev_data     = pose_history[-1]
+        prev_kps_list = prev_data.get("kps_list", [])
+        time_delta    = prev_data.get("time_delta", 0.04)
 
-                        # Velocidad de aproximación en píxeles por segundo.
-                        # Valor positivo = la mano se acerca a la cara.
-                        # Valor negativo = la mano se aleja de la cara.
-                        # Solo nos interesa el caso positivo (acercamiento).
-                        approach_left  = (dist_lw_prev - dist_lw_now) / dt
-                        approach_right = (dist_rw_prev - dist_rw_now) / dt
+        for cur_idx, cur_kps in enumerate(persons_kps):
+            cur_c = persons_centers[cur_idx]
 
-                        left_punching = (
-                            approach_left  > HIT_VELOCITY_THRESHOLD and
-                            dist_lw_now    < MAX_DISTANCE_TO_FACE
-                        )
-                        right_punching = (
-                            approach_right > HIT_VELOCITY_THRESHOLD and
-                            dist_rw_now    < MAX_DISTANCE_TO_FACE
-                        )
+            # Persona previa más cercana
+            best_prev, best_d = None, float("inf")
+            for prev_kps in prev_kps_list:
+                prev_c = get_bbox_center(prev_kps)
+                d = dist(cur_c, prev_c)
+                if d < best_d and d < 220:
+                    best_d, best_prev = d, prev_kps
 
-                        punch_detected = left_punching or right_punching
+            if best_prev and working_face:
+                hit_a, hit_c_a = detect_punch_approach(
+                    cur_kps, best_prev, time_delta, working_face
+                )
+                if hit_a:
+                    hit_approach_buffer.append(1)
+                    if len(hit_approach_buffer) > HIT_APPROACH_WINDOW:
+                        hit_approach_buffer.pop(0)
+                    if sum(hit_approach_buffer) >= HIT_APPROACH_MIN and hit_c_a:
+                        punch_confirmed     = True
+                        punch_person_center = cur_c
+                        # Dibujar línea muñeca → cara
+                        cv2.line(frame, hit_c_a, working_face, COLOR_AGGRESSOR, 2)
+                else:
+                    hit_approach_buffer.append(0)
+                    if len(hit_approach_buffer) > HIT_APPROACH_WINDOW:
+                        hit_approach_buffer.pop(0)
 
-                        # Línea roja visual que muestra la trayectoria del golpe
-                        # hacia el rostro, útil para verificar que el sistema
-                        # está midiendo correctamente durante las pruebas
-                        if punch_detected:
-                            active_wrist = (left_wrist if left_punching
-                                            else right_wrist)
-                            if active_wrist[0] > 0 and active_wrist[1] > 0:
-                                cv2.line(frame,
-                                         (int(active_wrist[0]),
-                                          int(active_wrist[1])),
-                                         working_face_center,
-                                         (0, 0, 255), 2)
-
-                pose_history.append(current_pos)
-
-            else:
-                # Sin cara conocida, guardamos igual para mantener el historial
-                pose_history.append({
-                    "lw":   left_wrist.tolist(),
-                    "rw":   right_wrist.tolist(),
-                    "time": datetime.now().timestamp()
-                })
-
-            # ── Paso 5: Ventana deslizante para confirmar el golpe ────────────
-            #
-            # Esta es la mejora clave respecto a la versión anterior.
-            # Antes: necesitábamos 6 frames PERFECTAMENTE consecutivos.
-            #        Si el frame 4 fallaba, el contador volvía a 0.
-            # Ahora: miramos los últimos 8 frames como un grupo y preguntamos
-            #        ¿cuántos de ellos detectaron golpe?
-            #        Si 5 o más lo hicieron, confirmamos la alerta.
-            #        Esto tolera 2-3 frames de ruido sin perder el conteo.
-
-            # Agregamos True o False según si este frame tuvo detección
-            hit_window_buffer.append(punch_detected)
-
-            # Mantenemos el buffer con máximo HIT_WINDOW_SIZE entradas.
-            # Cuando se llena, el frame más antiguo sale (deslizamiento).
-            if len(hit_window_buffer) > HIT_WINDOW_SIZE:
-                hit_window_buffer.pop(0)
-
-            # Contamos cuántos frames recientes tuvieron detección positiva
-            recent_hits = sum(hit_window_buffer)
-
-            # Confirmamos el golpe solo si:
-            # a) La ventana está llena (tenemos suficientes frames para decidir)
-            # b) Al menos HIT_WINDOW_MIN frames detectaron golpe
-            person_confirmed_hit = (
-                len(hit_window_buffer) >= HIT_WINDOW_SIZE and
-                recent_hits >= HIT_WINDOW_MIN
-            )
-
-            draw_skeleton(frame, person_kps, person_confirmed_hit)
-
-            if person_confirmed_hit:
-                frame_is_aggressive = True
-                status_text  = "!!! GOLPE DETECTADO"
-                status_color = (0, 0, 255)
-
-    # Mantenemos solo los últimos 15 frames en el historial de poses
-    if len(pose_history) > 15:
+    pose_history.append({
+        "kps_list":   [kps[:] for kps in persons_kps],
+        "time_delta": 0.04,
+    })
+    if len(pose_history) > 5:
         pose_history.pop(0)
 
-    # ── Paso 6: Generar evento de alerta con cooldown ─────────────────────────
-    # El cooldown evita que se generen decenas de alertas por el mismo incidente.
-    # Una vez confirmado el golpe, esperamos ALERT_COOLDOWN_SECONDS antes de
-    # generar otra alerta, aunque el golpe siga siendo detectado.
-    if frame_is_aggressive:
-        now = datetime.now().timestamp()
+    # ── 5. Brazo apuntando (Videos 1, 2, 5) ──────────────────────────────────
+    arm_ptr_c, arm_tgt_c = None, None
+    arm_confirmed        = False
+
+    if not in_warmup and num_persons >= 2:
+        ptr, tgt = detect_arm_pointing(persons_kps, persons_centers)
+        arm_point_buffer.append(1 if ptr is not None else 0)
+        if len(arm_point_buffer) > ARM_POINT_WINDOW:
+            arm_point_buffer.pop(0)
+        if sum(arm_point_buffer) >= ARM_POINT_MIN and ptr is not None:
+            arm_confirmed = True
+            arm_ptr_c, arm_tgt_c = ptr, tgt
+
+    # ── 6. Hurto (Video 3 — aseadora) ────────────────────────────────────────
+    theft_detected = False
+    theft_center   = None
+
+    if not in_warmup and persons_kps:
+        main_idx = max(range(num_persons), key=lambda i: get_bbox_area(persons_kps[i]))
+        main_kps = persons_kps[main_idx]
+        main_c   = persons_centers[main_idx]
+
+        gest_a = detect_theft_gesture(main_kps, frame_h)
+        gest_c = detect_pocket_gesture(main_kps, frame_h)
+
+        theft_pose_buffer.append(1 if (gest_a or gest_c) else 0)
+        if len(theft_pose_buffer) > THEFT_POSE_WINDOW:
+            theft_pose_buffer.pop(0)
+
+        obj_found, obj_person_c = detect_object_in_hand(small_obj_pos, persons_kps)
+        obj_in_hand_buffer.append(1 if obj_found else 0)
+        if len(obj_in_hand_buffer) > OBJ_HAND_WINDOW:
+            obj_in_hand_buffer.pop(0)
+
+        pose_score = sum(theft_pose_buffer) >= THEFT_POSE_MIN
+        obj_score  = sum(obj_in_hand_buffer) >= OBJ_HAND_MIN
+
+        if pose_score or obj_score:
+            theft_detected = True
+            theft_center   = obj_person_c or main_c
+
+    # ── 7. Persona en el suelo ────────────────────────────────────────────────
+    ground_persons = [i for i, kps in enumerate(persons_kps)
+                      if is_person_on_ground(kps, frame_h)]
+    has_ground = len(ground_persons) > 0
+
+    # ── 8. Ataque grupal (Video 4 — motos) ───────────────────────────────────
+    group_attack     = False
+    group_aggressors = []
+    group_victim_c   = None
+
+    if num_persons >= 2:
+        group_attack, group_aggressors, group_victim_c = detect_group_attack(
+            persons_kps, persons_centers, frame_h, has_ground
+        )
+        if group_attack:
+            group_confirmed = True
+
+    # Sostener alarma de grupo ya confirmada
+    if group_confirmed and not group_attack and not in_warmup:
+        for tr in tracked_roles:
+            if tr["role"] == "AGGRESSOR":
+                tr["frames_left"] = max(tr["frames_left"], ROLE_LOCK_FRAMES // 2)
+        group_attack = True
+
+    # ── 9. ¿Frame agresivo? ───────────────────────────────────────────────────
+    #
+    # [FIX 2] punch_confirmed YA NO activa agresión solo.
+    # Solo activa si TAMBIÉN hay arma YOLO O brazo apuntando.
+    # Esto evita que movimiento normal de manos en Videos 2 y 5
+    # dispare la alarma sin contexto de arma real.
+    #
+    # Los videos 3 y 4 NO dependen de punch_confirmed para activarse
+    # (usan theft_detected y group_attack respectivamente), así que
+    # este cambio no los afecta.
+    #
+    punch_with_weapon = punch_confirmed and (len(weapon_boxes) > 0 or arm_confirmed)
+
+    new_aggression = (
+        punch_with_weapon   or   # Golpe confirmado + arma/brazo
+        len(weapon_boxes) > 0 or # Arma YOLO sola (cuchillo detectado)
+        theft_detected        or # Video 3: aseadora
+        group_attack          or # Video 4: motos
+        arm_confirmed            # Videos 1/5: brazo apuntando
+    )
+
+    if new_aggression:
+        aggression_lock_counter = AGGRESSION_LOCK_FRAMES
+    else:
+        aggression_lock_counter = max(0, aggression_lock_counter - 1)
+
+    frame_is_aggressive = new_aggression or (aggression_lock_counter > 0)
+
+    # ── 10. Asignar roles ─────────────────────────────────────────────────────
+    if new_aggression and not in_warmup:
+
+        # Brazo apuntando → agresor y víctima con force=True
+        if arm_confirmed:
+            if arm_ptr_c:
+                assign_role(arm_ptr_c, "AGGRESSOR", force=True)
+            if arm_tgt_c:
+                assign_role(arm_tgt_c, "VICTIM", force=True)
+
+        # Arma YOLO → más cercano = agresor (si no es VICTIM)
+        if weapon_boxes and persons_centers:
+            for wb in weapon_boxes:
+                best_d, best_c = float("inf"), None
+                for pc in persons_centers:
+                    if pc:
+                        d = dist(pc, wb["center"])
+                        if d < best_d and d < 450:
+                            best_d, best_c = d, pc
+                if best_c and get_role_for_person(best_c) != "VICTIM":
+                    assign_role(best_c, "AGGRESSOR")
+                    for pc in persons_centers:
+                        if pc and pc != best_c and get_role_for_person(pc) is None:
+                            assign_role(pc, "VICTIM")
+
+        # Golpe → quien golpea = agresor
+        if punch_with_weapon and punch_person_center:
+            assign_role(punch_person_center, "AGGRESSOR")
+            for pc in persons_centers:
+                if pc and dist(pc, punch_person_center) > ROLE_MATCH_DIST:
+                    if get_role_for_person(pc) != "AGGRESSOR":
+                        assign_role(pc, "VICTIM")
+
+        # Persona en suelo → VICTIM
+        for i in ground_persons:
+            assign_role(get_bbox_center(persons_kps[i]), "VICTIM")
+
+        # Hurto → SUSPECT
+        if theft_detected and theft_center:
+            assign_role(theft_center, "SUSPECT")
+
+        # Ataque grupal → agresores y víctima
+        if group_attack and group_aggressors:
+            for ac in group_aggressors:
+                assign_role(ac, "AGGRESSOR", force=True)
+            if group_victim_c:
+                assign_role(group_victim_c, "VICTIM")
+
+        # Sin rol → VICTIM provisional
+        for pc in persons_centers:
+            if pc and get_role_for_person(pc) is None:
+                assign_role(pc, "VICTIM")
+
+    # ── 11. Dibujar esqueletos ────────────────────────────────────────────────
+    for pkps in persons_kps:
+        center = get_bbox_center(pkps)
+        role   = get_role_for_person(center) if not in_warmup else None
+
+        if in_warmup or not frame_is_aggressive or role is None:
+            color = COLOR_SAFE
+        elif role == "AGGRESSOR":
+            color = COLOR_AGGRESSOR
+        elif role == "VICTIM":
+            color = COLOR_VICTIM
+        elif role == "SUSPECT":
+            color = COLOR_SUSPECT
+        else:
+            color = COLOR_SAFE
+
+        draw_skeleton(frame, pkps, color)
+
+        if is_person_on_ground(pkps, frame_h) and not in_warmup and center:
+            cv2.putText(frame, "VICTIMA EN SUELO",
+                        (center[0]-55, center[1]-12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 255), 2)
+
+    # ── 12. Dibujar rostros ───────────────────────────────────────────────────
+    for face in faces:
+        fc   = face[4]
+        role = get_role_for_person(fc) if not in_warmup else None
+        if in_warmup or not frame_is_aggressive or role is None:
+            draw_face_box(frame, face, COLOR_SAFE, "Rostro")
+        elif role == "AGGRESSOR":
+            draw_face_box(frame, face, COLOR_AGGRESSOR, "Agresor")
+        elif role == "VICTIM":
+            draw_face_box(frame, face, COLOR_VICTIM, "Victima")
+        elif role == "SUSPECT":
+            draw_face_box(frame, face, COLOR_SUSPECT, "Sospechoso")
+        else:
+            draw_face_box(frame, face, COLOR_SAFE, "Rostro")
+
+    # ── 13. Alarma ────────────────────────────────────────────────────────────
+    if frame_is_aggressive and not in_warmup:
+        alarm.start_alarm("AGRESION DETECTADA")
+    else:
+        alarm.stop_alarm()
+
+    # ── 14. Evento con cooldown ───────────────────────────────────────────────
+    if new_aggression and not in_warmup:
+        now = time.time()
         if now - last_alert_time > ALERT_COOLDOWN_SECONDS:
             last_alert_time = now
             events.append({
-                "tipo":      "agresion",
-                "label":     "Golpe detectado: muneca aproximandose al rostro",
+                "tipo":      "alerta",
+                "label":     "AGRESION DETECTADA - Llamando al 123",
                 "confianza": 82.0,
-                "bbox":      None,
                 "timestamp": datetime.now().isoformat()
             })
 
-    # ── Texto de estado en la parte superior de la ventana ───────────────────
+    # ── 15. Barra de estado ───────────────────────────────────────────────────
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 45), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-    cv2.putText(frame, status_text, (10, 32),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, status_color, 2)
+    cv2.rectangle(overlay, (0, 0), (frame_w, 58), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    # Contador de la ventana deslizante para calibrar durante las pruebas.
-    # Te muestra exactamente cuántos de los últimos frames detectaron golpe.
-    recent = sum(hit_window_buffer) if hit_window_buffer else 0
-    total  = len(hit_window_buffer)
+    if in_warmup:
+        remaining = max(0, WARMUP_FRAMES - frames_analyzed)
+        cv2.putText(frame, f"Iniciando sistema... ({remaining} frames restantes)",
+                    (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 0), 2)
+    elif frame_is_aggressive:
+        cv2.putText(frame, "!!! AGRESION DETECTADA  -  ALARMA ACTIVA",
+                    (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 0, 255), 2)
+        cv2.putText(frame, "Llamando al 123 - Policia Nacional",
+                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 140, 255), 2)
+    else:
+        cv2.putText(frame, "Estado: Monitoreando...",
+                    (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 220, 0), 2)
+
+    agr_count = sum(1 for tr in tracked_roles if tr["role"] == "AGGRESSOR")
     cv2.putText(frame,
-                f"Detecciones recientes: {recent}/{total} (umbral: {HIT_WINDOW_MIN})",
-                (10, frame.shape[0] - 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                f"Agresores: {agr_count} | Personas: {num_persons} | "
+                f"Lock: {aggression_lock_counter} | Alarma: {'ACTIVA' if alarm.is_alarm_active() else 'OFF'}",
+                (8, frame_h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
 
-    cv2.putText(frame, "Presiona 'Q' para cerrar",
-                (10, frame.shape[0] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-
-    # ── Mostrar ventana con todo anotado ──────────────────────────────────────
-    cv2.imshow("PROJECT_VIGIA - Monitor en tiempo real", frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        cv2.destroyAllWindows()
-
-    return events
+    return events, frame
