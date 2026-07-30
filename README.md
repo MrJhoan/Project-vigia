@@ -2,7 +2,7 @@
 
 This branch contains the **final and most complete version of the original PROJECT VIGIA detection prototype**, independently designed and developed by **Jhoan García**.
 
-The prototype processes recorded videos or a live camera feed, analyzes frames with computer-vision models, identifies visual patterns associated with potentially criminal events, marks the people and objects involved, and activates an audible alarm when an event is confirmed.
+The prototype processes recorded videos or a live camera feed, analyzes frames with computer-vision models, identifies visual patterns associated with criminal acts in progress, marks the people and objects involved, and activates an audible alarm when an event is confirmed.
 
 > This is an experimental decision-support prototype. Its detections are not legal judgments and must always be reviewed by a person before any response or escalation.
 
